@@ -1,0 +1,860 @@
+---
+output:
+  knitrBootstrap::bootstrap_document:
+    title: "Regression Techniques"
+    theme: Journal
+    highlight: Zenburn
+    theme.chooser: FALSE
+    highlight.chooser: FALSE
+---
+<h1>Predicting Housing Prices</h1>
+<h3>Harish M</h3>
+
+```{r echo = FALSE}
+# Variable definitions to be printed in the webpage before execution
+param_out <- c("mse", "mspe", "rsq ", "adj_r", "aic", "bic", "coef_count", 
+               "mse_log", "mspe_log", "insig_coeff", "vif_vars", "residuals")
+param_desc <- c("Mean Square Error",
+                "Out of Sample Error",
+                "R-Squared",
+                "Adjusted R-Squared",
+                "Akaike information criterion",
+                "Bayesian information criterion",
+                "Number of coefficients used in the model",
+                "MSE, when log transform is applied on the target variable",
+                "MSPE when log transformed",
+                "Dataframe containing insignificant coefficients. p-value threshold is 0.01",
+                "Dataframe containing coefficients with VIF > 5",
+                "Residual plots for the model")
+gen_formula <- "medv ~ ."
+log_formula <- "log(medv) ~ . "
+```
+
+# Introduction
+
+The objective of this analysis is to build regression models and compare the results
+against that achievable through machine learning algorithms like decision trees, 
+random forests. Bagging and gradient boosting techniques are also employed later 
+to examine how well the model performance improves. The Boston Housing dataset is
+used in this analysis to predict the median value of the houses. More information 
+on the dataset can be found <u><a href="https://www.cs.toronto.edu/~delve/data/boston/bostonDetail.html"target="_blank">here</a></u>.
+
+The packages required to run this report are available in the codeblock below.
+
+```{r warning=FALSE, message=FALSE}
+library(dplyr) #The gasoline to the caR
+library(MASS) #Boston dataset
+library(rsample) #Sampling data into train and test
+library(boot) #Cross validate the model
+library(ggplot2) #Visualization
+library(tibble) #Data manipulation
+library(gridExtra) #Print ggplots together
+library(Hmisc) #Correlation
+library(corrplot) #Correlation plot 
+library(knitr) #Generate HTML doc
+library(car) #VIF check
+library(leaps) #Best subset regression
+library(ggfortify) #Residual analysis plots
+library(glmnet) #Regularized regressions
+library(rpart) #Decision trees
+library(rpart.plot) #Plot them
+library(ipred) #Decision tree Bagging
+library(ranger) #Random Forest
+library(gbm) #Gradient Boosting
+```
+<br><br>
+Each model is constructed on a 75% training dataset and then tested against the
+out of sample 25% observations.
+
+```{r}
+opts_chunk$set(message = FALSE, warning = FALSE)
+
+data <- Boston
+set.seed(1804)
+data_split <- initial_split(data, prop = .75, strata = "medv")
+data_train <- training(data_split)
+data_test  <- testing(data_split)
+```
+
+# Exploratory Analysis
+
+The dataset contains `r nrow(data)` rows and `r ncol(data)` columns.
+The variable of interest to us is `medv` which is the median value of homes in 
+the 1970's. The remaining `r ncol(data) - 1` columns act as predictor variables. The 
+list of variables, along with a description and summary statistics are presented below. 
+
+```{r}
+var_desc <- c("Crime rate",
+              "Prop of zoned lots over 25k sqft",
+              "Prop of non-retail business acres",
+              "Close to Charles river",
+              "N2O concentration",
+              "Rooms",
+              "Prop of owner-occupied units",
+              "Distance to employment centres",
+              "Access to radial highways",
+              "Tax rate",
+              "Pupil-Teacher ratio",
+              "Black population",
+              "Lower status of the population",
+              "Median value of home in $1000")
+
+summary_stats <- summary(data) %>% as.data.frame() %>% 
+  separate(Freq, into = c("stat", "value"), sep = ":" ) 
+summary_stats$value <- summary_stats$value %>% as.numeric() %>%  round(2)
+
+summary_stats <- summary_stats %>% spread(key = stat, value = value) %>%
+  mutate(Description = var_desc) %>% 
+  dplyr::select(c(2, 9, 8, 5, 6, 7)) %>% rename("Variable" = "Var2")
+summary_stats[4,5] <- summary_stats[4,6] <- NA
+summary_stats %>% kable(caption = "Variabel summary statistics")
+```
+<br><br>
+The histograms show the distribution of each variable. The data appears to be 
+exponentially distributed in some cases, skewed-normal in others. There doesn't 
+seem to be any glaring outliers.  
+
+The right skewed distribution of the response `medv` suggests that a log
+transformation on the variable could improve performance.
+
+```{r fig.height=8, fig.width=16}
+histo_viz <- list()
+for (i in colnames(data)) {
+  if (i == "chas") {
+    histo_viz[[i]] <- data %>% ggplot(aes_string(i)) + geom_bar() + theme_light()
+  } else {
+    histo_viz[[i]] <- data %>% ggplot(aes_string(i)) + geom_histogram() + theme_light()
+  }
+}
+grid.arrange(grobs = histo_viz, nrow = 4, ncol = 4, 
+             top = "Histograms to visualize data ranges" )
+```
+<br><br>
+The plot below shows the pairwise correlation of the variables. The color is the
+measure of correlation while the size of the circle indicates the p-value
+significance. There do seem to be several highly correlated variables. To overcome
+their influence in the model, Variance Influence Factors would need to be looked
+over.
+
+```{r fig.height=6, fig.width=8}
+cor_data <- rcorr(as.matrix(data))
+corrplot(cor_data$r, type = "full", order = "hclust", title = "Pairwise Correlation",
+         p.mat = cor_data$P, sig.level = 0.01, insig = "blank", mar = c(0,0,1,0)) 
+```
+
+# Ordinary Least Squares
+
+The general idea behind OLS modelling is to come up with a straight line that
+connects as many observations as possible in n-dimensions. The mathematics is that
+the squares of distance between the line and the observation point must be minimal.
+
+The function `regression` defined below accepts the formula for the `lm` and returns
+model evaluation parameters. It's reused throughout this report for all OLS models.
+
+```{r}
+regression <- function(regression_formula) {
+  
+  set.seed(1804)
+  model <- lm(as.formula(regression_formula), data_train)
+  
+  model_summary <- summary(model)
+  model_predict <- predict(model, data_test)
+  
+  vif_vars <- vif(model) %>% as.data.frame() %>% 
+    rownames_to_column("Variable") %>% filter( . > 5)
+  
+  insig_coeff <- summary(model)$coefficients %>% as.data.frame() %>% 
+    rownames_to_column("Variable") %>% rename("p_value" = `Pr(>|t|)` ) %>% 
+    filter( p_value > 0.01) %>% dplyr::select(c(1, 2, 5))
+  
+  coef_count <- length(model$coefficients) - 1
+  mse_log = (sum((exp(model$fitted.values) - data_train$medv)^2)) / (nrow(data_train) - 14)
+  mspe_log = (sum((exp(model_predict) - data_test$medv)^2)/(nrow(data_test) - 14))
+  
+  export_params <- list(mse = round((model_summary$sigma)^2, 3), 
+                        mspe = round(mean((model_predict - data_test$medv)^2), 3),
+                        rsq = round(model_summary$r.squared, 3),
+                        adj_r = round(model_summary$adj.r.squared, 3),
+                        aic = round(AIC(model), 0),
+                        bic = round(BIC(model), 0),
+                        coef_count = coef_count,
+                        mse_log = round(mse_log, 3),
+                        mspe_log = round(mspe_log, 3),
+                        insig_coeff = insig_coeff,
+                        vif_vars = vif_vars,
+                        residuals = autoplot(model, which = 1:3, 
+                                             ncol = 3, label.n = 0) + theme_light())
+  return(export_params) }
+```
+<br><br>
+The table below shows what each output parameter is.
+```{r}
+data.frame(parameter = param_out, description = param_desc) %>% kable()
+```
+
+## General Model
+
+The first model assumes that the `medv` has a liner relationship with all the 13
+variables. The formula
+<br><br>
+<center>`r gen_formula`</center>  
+
+is applied to get the following results.
+
+```{r}
+gen_formula <- "medv ~ ."
+gen_params <- regression(regression_formula = gen_formula)
+gen_out <- gen_params[1:7] %>% as.data.frame() 
+gen_caption <- "Basic GLM - All Variables"
+gen_out %>% kable(caption = gen_caption)
+```
+<br><br>
+The $R^2$ value of `r gen_params$rsq` is pretty good for a simple model. However the
+parameters `r gen_params$insig_coeff %>% pull(Variable) %>% paste0(collapse = ", ")`
+are not significant. Multicollinearity exists between these variables - `r gen_params$vif_vars %>% pull(Variable) %>% paste0(collapse = ", ")`.
+
+The plots below show the residual analyses for the model. It's observed that `medv`
+with extreme values are not being captured by the regression line. 
+
+```{r fig.height=6, fig.width=12}
+gen_params$residuals
+```
+<br><br>
+Removing the insignificant and collinear variables gives us these results.
+```{r}
+gen_insig_vif_formula <- paste0("medv ~ . -",
+                                bind_rows(gen_params$insig_coeff %>% dplyr::select(1), 
+                                          gen_params$vif_vars %>% dplyr::select(1)) %>%
+                                  pull("Variable") %>%
+                                  paste(collapse = " -"))
+
+gen_insig_vif_params <- regression(regression_formula = gen_insig_vif_formula)
+gen_insig_vif_out <- gen_insig_vif_params[1:7] %>% as.data.frame()
+gen_insig_vif_caption <- "GLM - Invalid parameters removed"
+gen_insig_vif_out %>% kable(caption = gen_insig_vif_caption)
+```
+## Model Interpretation
+
+The coefficients of the model above are printed below. 
+```{r fig.height=5, fig.width=10}
+coef(lm(as.formula(gen_insig_vif_formula), data = data_train)) %>% as.array() %>% as.data.frame() %>%
+  rownames_to_column("variable") %>%
+  rename("coefficient" = ".") %>% filter(coefficient != 0) %>%
+  ggplot(aes(coefficient, reorder(variable, coefficient))) +
+  geom_point(show.legend = FALSE, size = 3) + 
+  geom_text(aes(label = round(coefficient,3)), hjust = 0.5, vjust = -1) +
+  theme(text = element_text(size = 7)) + ylab("variables") + theme_light() +
+  ggtitle("Coefficients of the model")
+```
+
+<br><br>
+This can be interpreted such that, a unit increase in `rm`, for example, would increase
+the housing prices by 4.948(in $1000). A unit increse in `nox` however will decrease 
+`medv` by -15,582.
+
+## Log Transformation
+
+Applying log-transformation to the response variable significantly improves the 
+MSE and $R^2$. The formula
+<br><br>
+<center>`r log_formula`</center>  
+
+produces the following results. AIC and BIC do not apply to transformed regressions.
+
+```{r fig.height=6, fig.width=12}
+log_formula <- "log(medv) ~ . "
+log_params <- regression(regression_formula = log_formula)
+
+log_params$mse <- log_params$mse_log
+log_params$mspe <- log_params$mspe_log
+log_params$aic <- log_params$bic <- NA
+
+log_out <- log_params[1:7] %>% as.data.frame() 
+log_caption <- "medv is log-transformed"
+log_out %>% kable(caption = log_caption)
+```
+<br><br>
+The insignificant parameters `r log_params$insig_coeff %>% pull(Variable) %>% paste0(collapse = ", ")` and the multicollinear parameters `r log_params$vif_vars %>% pull(Variable) %>% paste0(collapse = ", ")` are removed from the equation to get the following results.
+
+```{r}
+log_insig_vif_formula <- paste0("log(medv) ~ . -",
+                                bind_rows(log_params$insig_coeff %>% dplyr::select(1), 
+                                          log_params$vif_vars %>% dplyr::select(1)) %>%
+                                  pull("Variable") %>%
+                                  paste(collapse = " -"))
+log_insig_vif_params <- regression(regression_formula = log_insig_vif_formula)
+
+log_insig_vif_params$aic <- log_insig_vif_params$bic <- NA
+log_insig_vif_params$mse <- log_insig_vif_params$mse_log
+log_insig_vif_params$mspe <- log_insig_vif_params$mspe_log
+
+log_insig_vif_out <- log_insig_vif_params[1:7] %>% as.data.frame()
+log_insig_vif_caption <- "Log - Invalid parameters removed"
+log_insig_vif_out %>% kable(caption = log_insig_vif_caption)
+```
+<br><br>
+As expected, there is a drop in the performance, going below the original model
+for the MSPE. The residuals also seem to indicate that log-transformation is 
+affecting the model negatively. Thus it makes sense to go back to the original 
+model. 
+
+```{r fig.height=6, fig.width=12}
+log_insig_vif_params$residuals
+```
+<br><br>
+A summary of all four models so far.
+```{r}
+bind_rows(gen_out, gen_insig_vif_out, log_out ,log_insig_vif_out) %>% 
+  mutate(model = c(gen_caption, gen_insig_vif_caption, log_caption, log_insig_vif_caption)) %>% 
+  kable(caption = "GLM Summary")
+```
+# Variable Subsetting
+
+## Best Subset Regression
+
+This method of variable selection acts like a carpet bomb, evaluating models
+for every permutation of the variable subsets. Obviously, this does not work well 
+when the number of features is high. It is also unlikely that any significant 
+increase in performance would be observed for our dataset.
+<br><br>
+The maximum size of the model is set to 13 and 10 subsets of each size are 
+evaluated for a total of 130 models.
+```{r}
+set.seed(1804)
+subset <- regsubsets(medv~., data_train, nbest = 10, nvmax = 13) %>% summary()
+
+subset_vars <- subset$which[which.max(subset$adjr2),] %>% as.data.frame() %>% 
+  rownames_to_column("Variable") %>% filter(. == TRUE) %>%
+  filter(Variable != "(Intercept)") %>% pull("Variable")
+
+subset_formula = paste("medv ~", paste(subset_vars, collapse = " + "))
+```
+<br><br>
+The model with the highest $adj\ R^2$ is
+<br><br>
+<center>`r subset_formula`</center>  
+
+It appears that the model takes only `r length(subset_vars)` out of `r ncol(data) - 1`
+features for max performance. The variables `r paste0(setdiff(colnames(data[1:13]), subset_vars))` are not included.
+
+The measures are printed below. As expected, the model performs similarly 
+to our original model.
+```{r}
+subset_params <- regression(regression_formula = subset_formula)
+subset_params[1:7] %>% as.data.frame() %>% kable(caption = "Best subset for max adj. R2")
+```
+
+## Forward and Backward Selection
+
+The idea behind forward selecting variables is that the model starts from no
+dependancy and adds one variable at a time to improve performance. It stops after
+it reaches a point where adding any more variables degrades the measures. Backward
+elimination works the oppposite, starting from all models to null. AIC is used
+to compare performance.
+
+```{r}
+set.seed(1804)
+
+full_model <- lm(medv ~ . , data_train)
+null_model <- lm(medv ~ 1 , data_train)
+
+step_aic_forward <- stepAIC(null_model, scope = list(lower = null_model, 
+                                                     upper = full_model),
+                            direction = "forward", trace = 0)
+
+step_aic_backward <- stepAIC(full_model, scope = list(lower = null_model, 
+                                                      upper = full_model),
+                             direction = "backward", trace = 0)
+
+forward_formula <- as.character(step_aic_forward$call)[2]
+backward_formula <- as.character(step_aic_backward$call)[2]
+```
+<br><br>
+For our dataset, both the methods reach the same formula.
+<br><br>
+<center>`r forward_formula`</center>  
+
+It is also noted that this formula is same as the best subset model. The measures 
+are printed below. 
+
+```{r}
+forward_params <- regression(regression_formula = forward_formula)
+forward_params[1:7] %>% as.data.frame() %>% kable(caption = "Forward and Backward selection")
+```
+
+# Regularized Regression
+
+Regularization in regression is used when the number of features is high or there
+exist multicollinearity between the variables. By bringing down the coefficient
+values, one can also improve the interpretability of the model.
+
+Building on the Ordinary Least Square regression, a penalty parameter $P$ is added 
+to the minimizing equation that works to reduce the $\beta$.
+<br>
+<center>$$minimize\  \{SSE + \lambda P \}$$</center>
+<br>
+The penalty parameter can take a wide range of values, controlled by the $\lambda$.
+The implementation also requires an $\alpha$ parameter. Setting $\alpha$ to 0 makes
+it a ridge regression, while lasso takes 1. Any value inbetween would be an elasticnet.
+Lasso and ridge differ by the definition of $P$ in the formula above. Elasticnet is
+a combination of both lasso and ridge, incorporating $\lambda P_{ridge} + \lambda P_{lasso}$
+to the equation.  
+
+My implementation applies an elastic net regression with $\alpha$ ranging between
+0 to 1, at increments of 0.01. The model with the least out-of-sample prediction
+error is selected. When applying the model to the test data, the minimum estimated
+$\lambda$ value and the $\lambda$ that is 1 se away from the minimum are applied. 
+This gives us a grid of 101 $\alpha$ values against 2 $\lambda$ for a total of 202 models.
+
+```{r}
+data_train_x <- model.matrix(medv ~ ., data_train)[, -14]
+data_test_x <- model.matrix(medv ~ ., data_test)[, -14]
+
+regularize_tuning <- expand.grid(alpha = seq(0, 1, by = 0.01),
+                                 mse_min = 0,
+                                 mspe_min = 0,
+                                 coef_count_min = 0,
+                                 mse_1se = 0,
+                                 mspe_1se = 0,
+                                 coef_count_1se = 0)
+
+for (i in 1:nrow(regularize_tuning)) {
+  set.seed(1804)
+  
+  model <- cv.glmnet(x = data_train_x, y = data_train$medv, nfolds = 5, 
+                     alpha = regularize_tuning$alpha[i])
+  
+  regularize_tuning$mse_min[i] <- round(model$cvm[model$lambda == model$lambda.min], 3)
+  regularize_tuning$mse_1se[i] <- round(model$cvm[model$lambda == model$lambda.1se], 3)
+  regularize_tuning$coef_count_min[i] <- coef(model, s = "lambda.min") %>% 
+    as.array() %>% as.data.frame() %>% rename(coef = "1") %>% filter(coef != 0) %>% nrow() - 1
+  regularize_tuning$coef_count_1se[i] <- coef(model, s = "lambda.1se") %>% 
+    as.array() %>% as.data.frame() %>% rename(coef = "1") %>% filter(coef != 0) %>% nrow() - 1
+  
+  predict_min <- predict(model, s = model$lambda.min, data_test_x)
+  predict_1se <- predict(model, s = model$lambda.1se, data_test_x)
+  
+  regularize_tuning$mspe_min[i] <- round(mean((predict_min - data_test$medv)^2), 3)
+  regularize_tuning$mspe_1se[i] <- round(mean((predict_1se - data_test$medv)^2), 3)
+}
+```
+<br><br>
+The table below shows the training and testing mean error at both $\lambda.min$ 
+and $\lambda.1se$ for $\alpha$ values with best performance. The reason why these 
+6 rows are selected out of 202 is explained in the last column.
+
+```{r}
+best_performers <- bind_rows(
+  regularize_tuning %>% filter(alpha == 1) %>% mutate(condition = "alpha = 1"),
+  regularize_tuning %>% filter(alpha == 0) %>% mutate(condition = "alpha = 0"),
+  regularize_tuning %>% arrange(mspe_1se) %>% head(1) %>% mutate(condition = "least mspe.1se"),
+  regularize_tuning %>% arrange(mse_1se) %>% head(1) %>% mutate(condition = "least mse.1se"),
+  regularize_tuning %>% arrange(mspe_min) %>% head(1) %>% mutate(condition = "least mspe.min"),
+  regularize_tuning %>% arrange(mse_min) %>% head(1) %>% mutate(condition = "least mse.min")) 
+
+best_performers %>% kable(caption = "Elastic Tune results")
+```
+<br><br>
+For the sake of model simplicity, $\alpha = 1$ is chosen to be the best. Choosing
+the 1se lambda will help avoid overfitting. This essentially makes it a lasso
+regression with the model predicted at 1se lambda.  
+
+The coefficients of the model are printed below.
+
+```{r fig.height=5, fig.width=10}
+set.seed(1804)
+lasso_model <- cv.glmnet(x = data_train_x, y = data_train$medv, nfolds = 5, alpha = 1)
+predict_lasso <- predict(lasso_model, s = lasso_model$lambda.1se, data_test_x)
+lasso_mse <- round(lasso_model$cvm[lasso_model$lambda == lasso_model$lambda.1se], 3)
+lasso_mspe <- round(mean((predict_lasso - data_test$medv)^2), 3)
+
+lasso_params <- data.frame(mspe = lasso_mspe, mse = lasso_mse)
+
+coef(lasso_model, s = "lambda.1se") %>% as.array() %>% as.data.frame() %>%
+  rownames_to_column("variable") %>%
+  rename("coefficient" = "1") %>% filter(coefficient != 0) %>%
+  ggplot(aes(coefficient, reorder(variable, coefficient))) +
+  geom_point(show.legend = FALSE, size = 3) + 
+  geom_text(aes(label = round(coefficient,3)), hjust = 0.5, vjust = -1) +
+  theme(text = element_text(size = 7)) + ylab("variables") + theme_light() +
+  ggtitle("Coefficients determined with Regularized regression")
+```
+
+# Regression Trees
+
+Any dataset can be broken into smaller subgroups hierarchially, like a tree, over 
+and over until each observation is by itself a leaf of a tree, giving a perfectly 
+fitted model. Decision tree algorithm works on the same idea, building a large 
+tree and then pruning from the bottom until an acceptable MSE is reached. Something
+to note is the fact that tree based model perform well on unprocessed data that
+has not been standardized.
+
+The pruning works a little similar to regularized regression, incorporating a cost-complexity
+parameter. Cross-validation is performed to get the optimal amount of branches.
+To understand the idea, here is a model with 10-fold cross validation (`default xval = 10`)
+and no pruning (`cp = 0`).
+
+```{r fig.height= 4, fig.width=8}
+dec_tree_model <- rpart(medv ~ ., data_train, method = "anova",
+                        control = list(cp = 0))
+plotcp(dec_tree_model)
+```
+<br><br>
+As it can be see, acceptable cv errors are reached as early as 8 branches. Thus, `rpart` will automatically choose that as the default number of branches. The pruned rpart tree is visualized.
+```{r fig.height= 6, fig.width=12}
+dec_tree_model <- rpart(medv ~ ., data_train, method = "anova")
+rpart.plot(dec_tree_model)
+```
+<br><br>
+Interpreting the model, the first split occurs based on `rm` values, and successively
+at `lstat` and `dis` to get `medv = 12` on the first terminal node. This means that
+any observation with rm < 7, lstat >= 14 and dis <2 is assigned a median price of 12.
+Decision tree models will be validated against the test data to calculate MSPE, 
+and the cross-validation error of the model. The function below evaluates both values.
+
+```{r}
+dec_tree_predict <- function(tree_model) {
+  
+  least_error <- tree_model$cptable %>% as.data.frame() %>% 
+    arrange(xerror) %>% head(1)
+  
+  tree_predict <- predict(tree_model, data_test)
+  tree_mspe <- round(mean((tree_predict - data_test$medv)^2), 3)
+  
+  export_params <- list(mspe = tree_mspe,
+                        cv_error = round(least_error$xerror, 3),
+                        cp = least_error$CP)
+  return(export_params)
+}
+```
+The basic model above has an MSPE of `r dec_tree_predict(dec_tree_model)$mspe` and
+a cross-validation error of `r dec_tree_predict(dec_tree_model)$cv_error`.
+<br><br>
+On top of pruning and cross-validation, decision trees can be further tuned by
+adjusting the `minsplit` and `maxdepth` parameters. 
+
+<ul>
+<li>Minsplit refers to the minimum number of observations that must exist in a 
+node before a split is attempted. The smaller the number, higher are the chances 
+of overfitting.  </li>
+<li>Maxdepth corresponds to the total number of nodes between each terminal node 
+and root node. Higher the number, larger the tree, meaning it could lead to overfitting.</li>
+</ul>
+
+With this knowledge, we build a grid of models for differente values of minsplit
+and maxdepth.
+```{r}
+dec_tree_tuning <- expand.grid(minsplit = seq(10, 50, by = 2),
+                               maxdepth = seq(5, 10),
+                               cp = 0,
+                               cv_error = 0,
+                               mspe = 0)
+
+for (i in 1:nrow(dec_tree_tuning)) {
+  set.seed(1804)
+  model <- rpart(medv ~ ., data_train, method = "anova",
+                 control = list(minsplit = dec_tree_tuning$minsplit[i],
+                                maxdepth = dec_tree_tuning$maxdepth[i]))
+  
+  model_params <- dec_tree_predict(model)
+  
+  dec_tree_tuning$cp[i] <- model_params$cp
+  dec_tree_tuning$cv_error[i] <- model_params$cv_error
+  dec_tree_tuning$mspe[i] <- model_params$mspe
+}
+```
+<br><br>
+The top 5 results, sorted by cross-validation error are printed below. We see tiny
+improvement of MSPE over the original model.
+```{r}
+dec_tree_tuning %>% arrange(cv_error) %>% head(5) %>% 
+  kable(caption = "Top 5 results of Decision Tree Tuning")
+```
+
+## Bagging
+
+What if the data is split into multiple chunks and trees are grown over each chunk
+and then averaged? That's the idea behind <b>b</b>ootstrap <b>agg</b>regat<b>ing</b>.  
+
+The data passed to the function is first split into `train` and `test` data. The
+`train` data is then bootstrap sampled(random, with replacement) into a number
+of chunks and unpruned trees are grown over each sample. Predictions are averaged
+to get the overall value. The `test` data, also called Out Of Bag data is now predicted
+and the MSE of this test data is used to evaluate model performance.
+
+```{r}
+tree_bag <- bagging(medv ~ ., data_train, coob = TRUE)
+tree_bag_oob <- round((tree_bag$err)^2, 3)
+
+tree_bag_predict <- predict(tree_bag, data_test)
+tree_bag_mspe <- round(mean((tree_bag_predict - data_test$medv)^2), 3)
+```
+<br><br>
+The out of bag error for this basic model is `r tree_bag_oob` and MSPE on the
+original test data is `r tree_bag_mspe`. This is significantly lower than any of
+the errors so far in all the models.
+
+Bagging creates 25 samples by default. Increasing the number of trees increases the
+prediction accuracy. In terms of bias-variance trade-off, deeper trees reduce the bias
+while larger number of trees reduce the variance. Below, we visualize the errors 
+with changing sample count between 10 to 100.
+```{r fig.height = 5, fig.width = 10}
+bag_tuning <- expand.grid(bag = seq(10, 100),
+                          oob_error = 0,
+                          mspe = 0)
+
+for (i in 1:nrow(bag_tuning)) {
+  set.seed(1804)
+  model <- bagging(medv ~ ., data_train, coob = TRUE, nbagg = bag_tuning$bag[i])
+  bag_tuning$oob_error[i] <- round((model$err)^2, 3)
+  
+  predict <- predict(model, data_test)
+  bag_tuning$mspe[i] <- round(mean((predict - data_test$medv)^2), 3)
+}
+
+low_bag_model <- bag_tuning %>% arrange(mspe) %>% filter(bag < 50, bag > 10) %>% head(1)
+
+bag_tuning %>% gather("type", "error", -bag) %>% 
+  ggplot(aes(bag, error, col = type)) +  geom_line() + 
+  geom_vline(xintercept = low_bag_model$bag, linetype = "dashed") +
+  geom_hline(yintercept = low_bag_model$mspe, linetype = "dashed") +
+  geom_point(aes(low_bag_model$bag, low_bag_model$mspe)) + theme_light() +
+  annotate("text", x = low_bag_model$bag + 8, y = low_bag_model$mspe - 0.5, 
+           label = paste0(low_bag_model$bag, ", ", low_bag_model$mspe))
+```
+<br><br>
+The lowest MSPE is achieved with `r bag_tuning %>% arrange(mspe) %>% head(1) %>% .$bag` 
+bags with a value of `r bag_tuning %>% arrange(mspe) %>% head(1) %>% .$mspe`. But the difference
+isn't large enough than, for example, 18-bag model with an mspe of `r low_bag_model$mspe`.
+
+# Random Forests
+
+The idea works very similar to bagging, modelling on bootstrapped data to create
+multiple trees. However, an additional parameter `mtry` is passed to the function
+that restricts the number of randomly chosen variables that can be used to build
+each tree. It essentially forces each tree to be different from one another,
+coercing all variables to be used in building the model. Setting `mtry` equal to
+the number of variables is the same as bagging. The rule of thumb, however, is to
+set mtry at one third of the number of variables. A simple model is built below.
+`num.trees` here refers to the number of bootstrap sampled trees to be built,
+same as `n_bagg`.
+```{r}
+ranger_model <- ranger(medv ~ ., data_train, num.trees  = 25, seed = 1804,
+                       mtry = floor((ncol(data) - 1) / 3))
+ranger_oob <- round(ranger_model$prediction.error, 3)
+
+ranger_predict <- predict(ranger_model, data_test)
+ranger_predict_mspe <- round(mean((ranger_predict$predictions - data_test$medv)^2), 3)
+```
+<br><br>
+Both the out of bag MSE and the validation test errors drop significantly to `r ranger_oob`
+and `r ranger_predict_mspe` respectively. We have come a long way from the mid-30's
+MSPE of OLS regressions!
+That doesn't mean this report is coming to an end. Decision trees can be tuned
+by running it through a grid of `num.trees`, `mtry`, `min.node.size` and `sample.fraction`.
+
+```{r}
+ranger_tuning <- expand.grid(num_trees = seq(50, 500, by = 10),
+                             mtry = seq(2, 7),
+                             min_nodes = seq(3, 10),
+                             sample_fraction = seq(0.6, 0.8, by = 0.05),
+                             oob_error = 0,
+                             mspe = 0)
+
+for (i in 1:nrow(ranger_tuning)) {
+  model <- ranger(medv ~ ., data_train, seed = 1804, mtry = ranger_tuning$mtry[i],
+                  num.trees  = ranger_tuning$num_trees[i],
+                  sample.fraction = ranger_tuning$sample_fraction[i],
+                  min.node.size = ranger_tuning$min_nodes[i])
+  predict <- predict(model, data_test)
+
+  ranger_tuning$oob_error[i] <- round(model$prediction.error, 3)
+  ranger_tuning$mspe[i] <- round(mean((predict$predictions - data_test$medv)^2), 3)
+}
+
+ranger_tuning %>% arrange(mspe) %>% head(5) %>% kable(caption = "Top 5 models by mspe")
+```
+<br><br>
+One thing of note is how OOB error is higher than the prediction error. This
+means that, on average, the model fits better on the test data than on the actual
+training bootstrap sample. The sample size is much smaller after bootstrapping
+and hence the variance in the training data could be much higher.
+<br><br>
+
+Unlike regression techniques, random forests suffer from the lack of interpretability.
+The best it can do is tell us the 'importance' of each variable. There are a couple
+of methods of measuring this importance.
+
+<ul>
+<li>Impurity - Calculates the improvement in MSE for each variable across all
+nodes and trees and averaged. Higher the average, higher is the importance.</li>
+<li>Permutation - Calculates the drop in MSE if the actual values passed to the
+trees during training are altered randomly. Higher the drop, higher the importance.</li>
+</ul>
+
+The importance of different variables, based on impurity and permutation are both
+visualized for the best model that was evaluated earlier.
+```{r fig.height = 6, fig.width=14}
+ranger_best_params <- ranger_tuning %>% arrange(mspe) %>% head(1)
+
+ranger_model_imp <- ranger(medv ~ ., data_train, seed = 1804, mtry = ranger_best_params$mtry,
+                           num.trees  = ranger_best_params$num_trees,
+                           sample.fraction = ranger_best_params$sample_fraction,
+                           min.node.size = ranger_best_params$min_nodes,
+                           importance = "impurity")
+
+ranger_model_per <- ranger(medv ~ ., data_train, seed = 1804, mtry = ranger_best_params$mtry,
+                           num.trees  = ranger_best_params$num_trees,
+                           sample.fraction = ranger_best_params$sample_fraction,
+                           min.node.size = ranger_best_params$min_nodes,
+                           importance = "permutation")
+
+grid.arrange(ranger_model_imp$variable.importance %>% as.data.frame() %>%
+               rename("Importance (Impurity)" = ".") %>%
+               rownames_to_column("Variable") %>% arrange(Variable) %>%
+               ggplot(aes(`Importance (Impurity)`, reorder(Variable, `Importance (Impurity)`))) +
+               geom_point() + theme_light() + theme(axis.title.y = element_blank()),
+
+             ranger_model_per$variable.importance %>% as.data.frame() %>%
+               rename("Importance (Permutation)" = ".") %>%
+               rownames_to_column("Variable") %>% arrange(Variable) %>%
+               ggplot(aes(`Importance (Permutation)`, reorder(Variable, `Importance (Permutation)`))) +
+               geom_point() + theme_light() + theme(axis.title.y = element_blank()),
+             ncol = 2, nrow = 1)
+```
+<br><br>
+It appears that the variables `lstat` and `rm` have the highest influence followed
+by `ptratio`, `indus` and `crim`.
+
+# Gradient Boosting
+
+All the techniques so far have either used all predictors, or a set of randomly
+chosen predictors while growing the tree. In gradient boosting however, predictors
+are made sequentially, learnt based on errors caused by previous predictors. Thus
+the observations are not randomly bootstrapped, and the trees grow only as long as
+the errors decrease.
+
+We are coming across two new parameters in the `gbm` function
+<ul>
+<li>`shrinkage` is the learning rate that indicates how fast the model is learning. Lower the number, slower, but without the risk of missing an optimum point. </li>
+<li>`bag.fraction` is fraction of training data selected to propose the next tree in
+the expansion.</li>
+</ul>
+
+A basic implementation is shown below. Since the model did not show any significant
+performance improvement with large number of trees, we limit the max tree count to
+`500`.
+```{r results="hide"}
+set.seed(1804)
+gbm_model <- gbm(medv ~ . , data_train, distribution = "gaussian", n.trees = 500,
+                 train.fraction = 0.75, interaction.depth = 5, verbose = FALSE,
+                 shrinkage = 0.3, n.minobsinnode = 12, bag.fraction = 0.75)
+
+gbm_predict <- predict(gbm_model, data_test, gbm_model$n.trees)
+
+gbm_mse <- min(gbm_model$valid.error)
+gbm_mspe <- mean((gbm_predict - data_test$medv)^2)
+gbm_num_trees <- which.min(gbm_model$valid.error)
+```
+<br><br>
+The model MSE and MSPE of the model are respectively `r round(gbm_mse, 3)`
+and `r round(gbm_mspe, 3)`. It took the model only `r gbm_num_trees` to reach this error.
+<br><br>
+Building a grid, the max number of trees is further brought down to 100, with
+shrinkage varying between 0.1 to 0.4. As the `n.trees` decreases, it's imperative
+to increase `shrinkage` as there are fewer opportunities for the model to learn.
+```{r}
+gbm_tuning <- expand.grid(shrinkage = seq(0.1, 0.4, by = 0.02),
+                          interaction_depth = seq(1, 8),
+                          node_min_obs = seq(4, 12, by = 2),
+                          bag_fraction = seq(0.7, 1, by = 0.1),
+                          tree_count = 0,
+                          mse = 0,
+                          mspe = 0)
+
+for (i in 1:nrow(gbm_tuning)) {
+
+  set.seed(1804)
+  model <- gbm(medv ~ ., data_train, distribution = "gaussian", n.trees = 100,
+               interaction.depth = gbm_tuning$interaction_depth[i],
+               shrinkage = gbm_tuning$shrinkage[i],
+               n.minobsinnode = gbm_tuning$node_min_obs[i],
+               bag.fraction = gbm_tuning$bag_fraction[i],
+               verbose = FALSE, train.fraction = 0.75)
+
+  predict <- predict(model, data_test, model$n.trees)
+
+  gbm_tuning$tree_count[i] <- which.min(model$valid.error)
+  gbm_tuning$mse[i] <- round(min(model$valid.error), 3)
+  gbm_tuning$mspe[i] <- round(mean((predict - data_test$medv)^2), 3)
+}
+
+gbm_tuning %>% arrange(mspe) %>% head(5) %>% kable(caption = "Top 5 models by MSPE")
+```
+<br><br>
+We see another drop in error levels compared to random forests. Looking at the
+results, it looks like the error can further be improved by reducing the minimum
+observations in node and the interaction depth.
+```{r}
+gbm_tuning <- expand.grid(shrinkage = seq(0.1, 0.4, by = 0.02),
+                          interaction_depth = seq(5, 10),
+                          node_min_obs = seq(1, 4, by = 1),
+                          bag_fraction = seq(0.8, 0.9, by = 0.05),
+                          tree_count = 0,
+                          mse = 0,
+                          mspe = 0)
+
+for (i in 1:nrow(gbm_tuning)) {
+
+  set.seed(1804)
+  model <- gbm(medv ~ ., data_train, distribution = "gaussian", n.trees = 100,
+               interaction.depth = gbm_tuning$interaction_depth[i],
+               shrinkage = gbm_tuning$shrinkage[i],
+               n.minobsinnode = gbm_tuning$node_min_obs[i],
+               bag.fraction = gbm_tuning$bag_fraction[i],
+               verbose = FALSE, train.fraction = 0.75)
+
+  predict <- predict(model, data_test, model$n.trees)
+
+  gbm_tuning$tree_count[i] <- which.min(model$valid.error)
+  gbm_tuning$mse[i] <- round(min(model$valid.error), 3)
+  gbm_tuning$mspe[i] <- round(mean((predict - data_test$medv)^2), 3)
+}
+
+gbm_tuning %>% arrange(mspe) %>% head(10) %>% kable(caption = "Top 10 models by MSPE")
+```
+<br><br>
+As expected, results improve. The variable importance is visualized for the best model.
+```{r }
+set.seed(1804)
+gbm_best_params <- gbm_tuning %>% arrange(mspe) %>% head(1)
+
+gbm_best_params <- data.frame(shrinkage = 0.3,
+                          interaction_depth = 10,
+                          node_min_obs = 4,
+                          bag_fraction = 0.9,
+                          tree_count = 0,
+                          mse = 0,
+                          mspe = 0)
+
+gbm_best_model <- gbm(medv ~ ., data_train, distribution = "gaussian", n.trees = 100,
+                      interaction.depth = gbm_best_params$interaction_depth[1],
+                      shrinkage = gbm_best_params$shrinkage[1],
+                      n.minobsinnode = gbm_best_params$node_min_obs[1],
+                      bag.fraction = gbm_best_params$bag_fraction[1],
+                      verbose = FALSE, train.fraction = 0.75)
+
+summary(gbm_best_model, cBars = ncol(data),
+        method = relative.influence, las = 2, plotit = FALSE) %>% 
+  mutate(rel_inf_3 = round(rel.inf, 3)) %>% 
+  ggplot(aes(rel_inf_3, reorder(rel_inf_3,var))) + geom_point() + theme_light()
+```
+
+# Summary
+
+The basic linear model had a prediction error of `r gen_out$mspe`. This means that
+the predictions are off by `r gen_out$mspe * 1000` USD on an average. This is a 
+pretty large number when the house prices go as low as `r data %>% arrange(medv) %>% head(1) %>% .$medv * 1000` USD. But machine learning techniques bring down the average error to as low
+as `r gbm_tuning %>% arrange(mspe) %>% head(1) %>% .$mspe`. This is over a three 
+fold decrease in error and a demonstration of how well advanced techniques can 
+improve model performance.
